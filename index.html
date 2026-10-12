@@ -1,0 +1,141 @@
+<!-- =====================================================================
+     MODULE VCLIENT — à coller dans la V81, juste avant </body>
+     - Remplace l'upload Excel par un sélecteur de jeux de données (Drive)
+     - Passe le dashboard en lecture seule (PPT, upload, réglages masqués)
+     - Garde : filtres & période, export Excel des graphiques, vues sauvegardées
+     3 choses à brancher : endpoint, token, et loadFile (voir CONFIG)
+     ===================================================================== -->
+<style>
+  /* --- Lecture seule : ajuster les sélecteurs aux classes de la V81 --- */
+  body.vclient .vc-hide,
+  body.vclient #uploadZone, body.vclient .upload-zone, body.vclient input[type=file],
+  body.vclient .btn-ppt, body.vclient [data-action="export-ppt"], body.vclient #pptSettings,
+  body.vclient .admin-only { display: none !important; }
+
+  #vcBar { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    padding:10px 16px; border-bottom:1px solid var(--border, #e5e5e5);
+    background:var(--surface, #fff); font:13px/1.4 inherit; position:sticky; top:0; z-index:50; }
+  #vcBar .vc-client { font-weight:600; letter-spacing:.02em; }
+  #vcBar select { min-width:260px; max-width:100%; padding:6px 10px; border-radius:8px;
+    border:1px solid var(--border, #d9d9d9); background:var(--surface, #fff); color:inherit; font:inherit; }
+  #vcBar .vc-meta { color:var(--muted, #888); font-size:12px; }
+  #vcBar .vc-badge { margin-left:auto; font-size:11px; padding:3px 8px; border-radius:999px;
+    background:var(--chip, #f2f2f2); color:var(--muted, #666); }
+  #vcOverlay { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+    background:rgba(0,0,0,.25); z-index:999; font:14px inherit; color:#fff; }
+  #vcOverlay.on { display:flex; }
+  @media (max-width:600px){ #vcBar select{ min-width:0; flex:1 } #vcBar .vc-badge{ margin-left:0 } }
+</style>
+
+<div id="vcOverlay"><span id="vcOverlayTxt">Chargement des données…</span></div>
+
+<script>
+(function () {
+  /* ============================ CONFIG ============================ */
+  var CONFIG = {
+    endpoint: 'https://script.google.com/macros/s/XXXXXXXX/exec', // URL /exec du Apps Script
+    token:    'IBwtJG6UVOfGOBVblnbR4hQQPEVPOBhM',
+    autoLoadLatest: true,          // charge le jeu le plus récent à l'ouverture
+    cacheMinutes: 30,              // cache navigateur du fichier (0 = désactivé)
+
+    // Branchement sur la V81 : reçoit un objet File, comme si l'utilisateur
+    // l'avait glissé dans la zone d'upload. Remplacer par la fonction réelle.
+    loadFile: function (file) {
+      if (typeof window.handleFile === 'function') return window.handleFile(file);
+      if (typeof window.processFile === 'function') return window.processFile(file);
+      // Repli : simuler un upload sur le premier <input type=file> existant
+      var input = document.querySelector('input[type=file]');
+      if (input) {
+        var dt = new DataTransfer(); dt.items.add(file); input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
+      console.error('[VCLIENT] Aucun point d’entrée trouvé pour charger le fichier.');
+    }
+  };
+  /* ================================================================ */
+
+  document.body.classList.add('vclient');
+  var LS_KEY = 'vclient:lastDataset';
+
+  var bar = document.createElement('div');
+  bar.id = 'vcBar';
+  bar.innerHTML =
+    '<span class="vc-client" id="vcClient"></span>' +
+    '<select id="vcSelect" aria-label="Jeu de données"><option>Chargement…</option></select>' +
+    '<span class="vc-meta" id="vcMeta"></span>' +
+    '<span class="vc-badge">Lecture seule</span>';
+  document.body.insertBefore(bar, document.body.firstChild);
+
+  var sel = document.getElementById('vcSelect');
+  var meta = document.getElementById('vcMeta');
+  var overlay = document.getElementById('vcOverlay');
+  var datasets = [];
+
+  function api(params) {
+    var q = Object.keys(params).map(function (k) { return k + '=' + encodeURIComponent(params[k]); }).join('&');
+    return fetch(CONFIG.endpoint + '?token=' + encodeURIComponent(CONFIG.token) + '&' + q)
+      .then(function (r) { return r.json(); })
+      .then(function (j) { if (!j.ok) throw new Error(j.error || 'erreur'); return j; });
+  }
+  function fmtDate(iso) {
+    try { return new Date(iso).toLocaleDateString('fr-FR', { day:'2-digit', month:'short', year:'numeric' }); }
+    catch (e) { return ''; }
+  }
+  function busy(on, txt) {
+    document.getElementById('vcOverlayTxt').textContent = txt || 'Chargement des données…';
+    overlay.classList.toggle('on', !!on);
+  }
+  function b64ToFile(b64, name) {
+    var bin = atob(b64), n = bin.length, u8 = new Uint8Array(n);
+    for (var i = 0; i < n; i++) u8[i] = bin.charCodeAt(i);
+    return new File([u8], name, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+  function cacheGet(ds) {
+    if (!CONFIG.cacheMinutes) return null;
+    try {
+      var c = JSON.parse(sessionStorage.getItem('vclient:f:' + ds.id) || 'null');
+      if (c && c.updated === ds.updated && Date.now() - c.t < CONFIG.cacheMinutes * 60000) return c;
+    } catch (e) {}
+    return null;
+  }
+  function cacheSet(ds, j) {
+    if (!CONFIG.cacheMinutes) return;
+    try { sessionStorage.setItem('vclient:f:' + ds.id, JSON.stringify({ t: Date.now(), updated: ds.updated, name: j.name, b64: j.b64 })); }
+    catch (e) { /* quota dépassé : on ignore */ }
+  }
+
+  function loadDataset(id) {
+    var ds = datasets.filter(function (d) { return d.id === id; })[0];
+    if (!ds) return;
+    try { localStorage.setItem(LS_KEY, id); } catch (e) {}
+    meta.textContent = 'Mis à jour le ' + fmtDate(ds.updated);
+    var cached = cacheGet(ds);
+    if (cached) { CONFIG.loadFile(b64ToFile(cached.b64, cached.name)); return; }
+    busy(true, 'Chargement de « ' + ds.label + ' »…');
+    api({ action: 'file', id: id })
+      .then(function (j) { cacheSet(ds, j); CONFIG.loadFile(b64ToFile(j.b64, j.name)); })
+      .catch(function (e) { meta.textContent = 'Impossible de charger ce jeu (' + e.message + ')'; })
+      .then(function () { busy(false); });
+  }
+
+  sel.addEventListener('change', function () { loadDataset(sel.value); });
+
+  api({ action: 'list' }).then(function (j) {
+    document.getElementById('vcClient').textContent = j.client || '';
+    datasets = j.datasets || [];
+    if (!datasets.length) { sel.innerHTML = '<option>Aucun jeu de données disponible</option>'; sel.disabled = true; return; }
+    sel.innerHTML = datasets.map(function (d) {
+      return '<option value="' + d.id + '">' + d.label.replace(/</g, '&lt;') + '</option>';
+    }).join('');
+    var last = null; try { last = localStorage.getItem(LS_KEY); } catch (e) {}
+    var start = datasets.some(function (d) { return d.id === last; }) ? last : datasets[0].id;
+    sel.value = start;
+    if (CONFIG.autoLoadLatest || last) loadDataset(start);
+  }).catch(function (e) {
+    sel.innerHTML = '<option>Accès indisponible</option>'; sel.disabled = true;
+    meta.textContent = e.message === 'unauthorized' ? 'Lien d’accès invalide.' : 'Erreur de connexion aux données.';
+  });
+})();
+</script>
+<!-- ======================= FIN MODULE VCLIENT ======================= -->
